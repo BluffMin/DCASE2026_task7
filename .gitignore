@@ -1,2 +1,19 @@
+# .gitignore 파일 내용
+__pycache__/
+*.pyc
+
+# Dataset (데이터셋 폴더 이름에 맞게 수정)
+data/
+dataset/
 *.wav
+
+# Model Weights
 *.pth
+*.pt
+*.ckpt
+
+# IDE / OS
+.vscode/
+.DS_Store
+
+logs
