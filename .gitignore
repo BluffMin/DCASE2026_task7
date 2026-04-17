@@ -16,4 +16,4 @@ dataset/
 .vscode/
 .DS_Store
 
-logs
+logs*
