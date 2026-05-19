@@ -1,12 +1,25 @@
+# baseline_DIL_task7_geometry.py
+"""
+D1 checkpoint initialized geometry experiment for DCASE 2026 Task 7.
+
+Flow:
+- load baseline-compatible weights from checkpoint_D1.pth into GeometryCnn14
+- do NOT train on D1 (D1 dev data is unavailable)
+- incrementally adapt on D2, then D3
+- during evaluation/inference, consider D1/D2/D3 branches all together
+- route by energy + optional anchor distance score
+- save logs and outputs
+"""
+
 import argparse
 import copy
 import json
 import os
-import sys
+import random
 import time
 import traceback
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -14,17 +27,16 @@ import torch.nn as nn
 import torch.optim as optim
 
 import config_task7 as config
-from config_task7 import sample_rate, mel_bins, fmin, fmax, window_size, hop_size
 from datasetfactory_task7 import DILDatasetInc as DILDataset
 from domain_net_geometry import GeometryCnn14
 from utilities import get_filename
 
 
 # =========================================================
-# Utility / Logger
+# misc
 # =========================================================
 
-def now_str():
+def now_str() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
 
@@ -33,10 +45,15 @@ def ensure_dir(path: str):
 
 
 def seed_everything(seed: int = 1193):
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
+# =========================================================
+# logger
+# =========================================================
 
 class RunLogger:
     def __init__(self, args_dict: dict, exp_id: Optional[str] = None, base_dir: str = "logs"):
@@ -47,8 +64,8 @@ class RunLogger:
 
         self.train_log_path = os.path.join(self.run_dir, "train_log.jsonl")
         self.summary_path = os.path.join(self.run_dir, "summary.json")
-        self.result_csv_path = os.path.join(self.run_dir, "result.csv")
         self.note_path = os.path.join(self.run_dir, "notes.txt")
+        self.result_csv_path = os.path.join(self.run_dir, "result.csv")
         self.config_path = os.path.join(self.run_dir, "config.json")
 
         self.summary = {
@@ -107,10 +124,11 @@ class RunLogger:
 
     def export_notion_row(
         self,
-        architecture: str = "GeometryCnn14 + Residual Adapters",
-        cl_method: str = "Stable Class Geometry + Structure Preservation",
+        architecture: str = "GeometryCnn14 (D1-init) + Residual Adapters",
+        cl_method: str = "D1 checkpoint initialization + Structure Preservation",
         augmentation: str = "None",
     ):
+        d1 = self.summary["per_domain_acc"].get("D1", "-")
         d2 = self.summary["per_domain_acc"].get("D2", "-")
         d3 = self.summary["per_domain_acc"].get("D3", "-")
         avg = self.summary["avg_acc"] if self.summary["avg_acc"] is not None else "-"
@@ -121,6 +139,7 @@ class RunLogger:
             f"{architecture} | "
             f"{cl_method} | "
             f"{augmentation} | "
+            f"{d1} | "
             f"{d2} | "
             f"{d3} | "
             f"{avg}"
@@ -131,7 +150,7 @@ class RunLogger:
 
 
 # =========================================================
-# Loss Config
+# loss helpers
 # =========================================================
 
 @dataclass
@@ -142,10 +161,6 @@ class LossWeights:
     distill: float = 0.5
     structure: float = 0.1
 
-
-# =========================================================
-# Helper Functions
-# =========================================================
 
 def pairwise_distance_matrix(x: torch.Tensor) -> torch.Tensor:
     return torch.cdist(x, x, p=2)
@@ -178,21 +193,20 @@ def accuracy_from_logits(logits: torch.Tensor, targets_onehot: torch.Tensor) -> 
 
 
 # =========================================================
-# Learner
+# learner
 # =========================================================
 
 class Learner:
     """
-    Geometry variant:
-    - D2 -> task_id 0
-    - D3 -> task_id 1
-
-    즉 이 스크립트는 D1 checkpoint를 직접 쓰지 않고,
-    geometry model을 D2와 D3 순서로 학습하도록 구성한 버전입니다.
+    Task mapping:
+    0 -> D1
+    1 -> D2
+    2 -> D3
     """
 
     def __init__(
         self,
+        logger: RunLogger,
         sample_rate: int,
         window_size: int,
         hop_size: int,
@@ -200,9 +214,12 @@ class Learner:
         fmin: int,
         fmax: int,
         classes_num: int,
-        num_tasks: int,
-        logger: RunLogger,
+        num_tasks: int = 3,
+        embed_dim: int = 256,
     ):
+        self.logger = logger
+        self.loss_weights = LossWeights()
+
         self.model = GeometryCnn14(
             sample_rate=sample_rate,
             window_size=window_size,
@@ -211,16 +228,19 @@ class Learner:
             fmin=fmin,
             fmax=fmax,
             classes_num=classes_num,
-            num_tasks=num_tasks,
+            nb_tasks=num_tasks,
+            embed_dim=embed_dim,
         )
 
-        self.num_tasks = num_tasks
-        self.cur_task = -1
         self.prev_model: Optional[GeometryCnn14] = None
         self.reference_anchor_dist: Optional[torch.Tensor] = None
-        self.loss_weights = LossWeights()
-        self.logger = logger
 
+        self.domain_to_task = {"D1": 0, "D2": 1, "D3": 2}
+        self.seen_domains = ["D1"]  # D1 is seen from checkpoint init
+
+    # -------------------------------------------------
+    # io helpers
+    # -------------------------------------------------
     def _make_loader(self, df, batch_size: int, shuffle: bool, num_workers: int):
         dataset = DILDataset(df, config.audio_folder_DIL)
         return torch.utils.data.DataLoader(
@@ -231,93 +251,74 @@ class Learner:
             pin_memory=True,
         )
 
-    def _checkpoint_path(self, task_name: str):
+    def _geometry_ckpt_path(self, domain_name: str):
         ensure_dir(config.save_resume_path)
-        return os.path.join(config.save_resume_path, f"geometry_checkpoint_{task_name}.pth")
+        return os.path.join(config.save_resume_path, f"geometry_checkpoint_{domain_name}.pth")
 
-    def _save_checkpoint(self, task_name: str):
-        ckpt_path = self._checkpoint_path(task_name)
+    def save_geometry_checkpoint(self, domain_name: str):
+        ckpt_path = self._geometry_ckpt_path(domain_name)
         torch.save(self.model.state_dict(), ckpt_path)
         print(f"[Checkpoint] saved: {ckpt_path}")
 
-    def _load_checkpoint(self, task_name: str, device: str):
-        ckpt_path = self._checkpoint_path(task_name)
+    def load_geometry_checkpoint(self, domain_name: str, device: str):
+        ckpt_path = self._geometry_ckpt_path(domain_name)
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-        state = torch.load(ckpt_path, map_location=torch.device(device))
-        self.model.load_state_dict(state)
+        state = torch.load(ckpt_path, map_location=device)
+        self.model.load_state_dict(state, strict=True)
         print(f"[Checkpoint] loaded: {ckpt_path}")
 
-    def _compute_routed_accuracy(
-        self,
-        loader,
-        seen_task_ids: List[int],
-        seen_domain_names: List[str],
-        device: str,
-        output_tag: str = "",
-    ) -> float:
-        self.model.to(device)
-        self.model.eval()
+    # -------------------------------------------------
+    # D1 init
+    # -------------------------------------------------
+    def initialize_from_d1_checkpoint(self, device: str, ckpt_name: str = "checkpoint_D1.pth"):
+        d1_ckpt_path = os.path.join(config.save_resume_path, ckpt_name)
+        if not os.path.exists(d1_ckpt_path):
+            raise FileNotFoundError(
+                f"D1 checkpoint not found: {d1_ckpt_path}\n"
+                f"Expected path based on config.save_resume_path={config.save_resume_path}"
+            )
 
-        correct = 0
-        total = 0
+        ckpt = torch.load(d1_ckpt_path, map_location=device)
+        loaded, skipped = self.model.partial_load_from_baseline(ckpt)
+        self.model.init_anchors_from_fc()
 
-        ensure_dir(config.output_folder)
-        out_file = os.path.join(config.output_folder, f"output_geometry_{output_tag}_{now_str()}.txt")
+        self.logger.write_note(f"D1 partial init from: {d1_ckpt_path}")
+        self.logger.write_note(f"Loaded keys: {len(loaded)}")
+        self.logger.write_note(f"Skipped keys: {len(skipped)}")
 
-        id_to_class = {v: k for k, v in config.dict_class_labels.items()}
+        print(f"[D1 Init] checkpoint: {d1_ckpt_path}")
+        print(f"[D1 Init] loaded={len(loaded)}, skipped={len(skipped)}")
 
-        with open(out_file, "w", encoding="utf-8") as f:
-            for inputs, targets, audio_files in loader:
-                inputs = inputs.float().to(device)
-                targets = targets.float().to(device)
-                gt = torch.argmax(targets, dim=-1)
-
-                branch_logits = []
-                branch_energy = []
-
-                with torch.no_grad():
-                    for task_id in seen_task_ids:
-                        logits = self.model(inputs, task_id)
-                        energy = -torch.logsumexp(logits, dim=1)
-                        branch_logits.append(logits)
-                        branch_energy.append(energy)
-
-                    branch_logits = torch.stack(branch_logits, dim=1)   # [B, T, C]
-                    branch_energy = torch.stack(branch_energy, dim=1)   # [B, T]
-                    best_branch = torch.argmin(branch_energy, dim=1)    # [B]
-
-                    batch_indices = torch.arange(branch_logits.size(0), device=device)
-                    routed_logits = branch_logits[batch_indices, best_branch]
-                    pred = torch.argmax(routed_logits, dim=1)
-
-                correct += (pred == gt).sum().item()
-                total += gt.numel()
-
-                pred_labels = [id_to_class[int(p)] for p in pred.detach().cpu().tolist()]
-                for file_name, label in zip(audio_files, pred_labels):
-                    f.write(file_name + "\t" + label + "\n")
-
-        return round(100.0 * correct / max(total, 1), 2)
-
-    def _update_reference_geometry(self):
-        with torch.no_grad():
-            anchors = torch.nn.functional.normalize(self.model.class_anchors.detach(), dim=-1)
-            self.reference_anchor_dist = pairwise_distance_matrix(anchors).detach().cpu()
+        self._freeze_snapshot()
+        self._update_reference_geometry()
 
     def _freeze_snapshot(self):
         self.prev_model = copy.deepcopy(self.model).eval().cpu()
         for p in self.prev_model.parameters():
             p.requires_grad = False
 
-    def incremental_train(self, train_loader, device: str, args, task_name: str):
+    def _update_reference_geometry(self):
+        with torch.no_grad():
+            anchors = torch.nn.functional.normalize(self.model.class_anchors.detach(), dim=-1)
+            self.reference_anchor_dist = pairwise_distance_matrix(anchors).detach().cpu()
+
+    # -------------------------------------------------
+    # train
+    # -------------------------------------------------
+    def incremental_train(self, train_loader, device: str, args, domain_name: str):
+        task_id = self.domain_to_task[domain_name]
         self.model.to(device)
-        self.model.unfreeze_task(self.cur_task, train_backbone_for_first_task=True)
+        self.model.unfreeze_for_task(task_id)
+
+        if self.prev_model is not None:
+            self.prev_model.to(device)
+            self.prev_model.eval()
 
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        lr = args.learning_rate if self.cur_task == 0 else args.learning_rate / 5.0
+        lr = args.learning_rate
 
-        optimizer = torch.optim.Adam(
+        optimizer = optim.Adam(
             trainable_params,
             lr=lr,
             betas=(0.9, 0.999),
@@ -329,10 +330,6 @@ class Learner:
             eta_min=1e-6,
         )
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
-
-        if self.prev_model is not None:
-            self.prev_model.to(device)
-            self.prev_model.eval()
 
         best_epoch = 0
         best_loss = float("inf")
@@ -356,10 +353,10 @@ class Learner:
 
                 optimizer.zero_grad()
 
-                logits, embedding = self.model(audio, self.cur_task, return_embedding=True)
+                logits, emb = self.model(audio, task_id, return_embedding=True)
 
                 ce_loss = criterion(logits, target_idx)
-                anchor_dict = compute_anchor_losses(embedding, target_idx, self.model)
+                anchor_dict = compute_anchor_losses(emb, target_idx, self.model)
                 anchor_pull = anchor_dict["anchor_pull"]
                 anchor_sep = anchor_dict["anchor_sep"]
 
@@ -372,7 +369,7 @@ class Learner:
                 distill_loss = torch.tensor(0.0, device=device)
                 if self.prev_model is not None:
                     with torch.no_grad():
-                        prev_logits, _ = self.prev_model(audio, max(self.cur_task - 1, 0), return_embedding=True)
+                        prev_logits = self.prev_model(audio, 0 if domain_name == "D2" else 1 if "D2" in self.seen_domains else 0)
                     distill_loss = torch.nn.functional.mse_loss(logits, prev_logits)
                     total_loss = total_loss + self.loss_weights.distill * distill_loss
 
@@ -410,7 +407,7 @@ class Learner:
             avg_batch_acc = epoch_batch_acc / max(1, num_batches)
 
             print(
-                f"[Task {task_name}] "
+                f"[Task {domain_name}] "
                 f"epoch={epoch_idx:03d} "
                 f"loss={avg_total_loss:.4f} "
                 f"ce={avg_ce:.4f} "
@@ -422,8 +419,8 @@ class Learner:
             )
 
             self.logger.log_epoch({
-                "task_name": task_name,
-                "task_id": self.cur_task,
+                "task_name": domain_name,
+                "task_id": task_id,
                 "epoch": epoch_idx,
                 "total_loss": float(avg_total_loss),
                 "ce_loss": float(avg_ce),
@@ -439,64 +436,123 @@ class Learner:
                 best_loss = avg_total_loss
                 best_epoch = epoch_idx
 
-        self.logger.set_best_epoch(task_name, best_epoch)
+        self.logger.set_best_epoch(domain_name, best_epoch)
 
         if args.save:
-            self._save_checkpoint(task_name)
+            self.save_geometry_checkpoint(domain_name)
 
         self._freeze_snapshot()
         self._update_reference_geometry()
 
-    def incremental_setup(self, train_df, batch_size: int, num_workers: int, device: str, args, task_name: str):
-        self.cur_task += 1
-
-        if args.resume:
-            self._load_checkpoint(task_name, device)
-            return
-
-        train_loader = self._make_loader(
-            train_df,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-        )
-        self.incremental_train(train_loader, device, args, task_name)
-
-    def evaluate_seen_domains(
+    # -------------------------------------------------
+    # routing / inference
+    # -------------------------------------------------
+    def route_and_predict(
         self,
-        seen_domain_names: List[str],
+        audio: torch.Tensor,
+        candidate_domains: List[str],
+        device: str,
+        alpha_energy: float = 1.0,
+        beta_anchor: float = 0.1,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.model = self.model.to(device)
+        self.model.eval()
+        audio = audio.to(device)
+
+        branch_logits = []
+        branch_scores = []
+
+        anchors = torch.nn.functional.normalize(
+            self.model.class_anchors.to(device), dim=-1
+        )
+
+        with torch.no_grad():
+            for domain_name in candidate_domains:
+                task_id = self.domain_to_task[domain_name]
+                logits, emb = self.model(audio, task_id, return_embedding=True)
+
+                energy = -torch.logsumexp(logits, dim=1)
+                anchor_dist = torch.cdist(emb, anchors).min(dim=1).values
+                score = alpha_energy * energy + beta_anchor * anchor_dist
+
+                branch_logits.append(logits)
+                branch_scores.append(score)
+
+        branch_logits = torch.stack(branch_logits, dim=1)
+        branch_scores = torch.stack(branch_scores, dim=1)
+        best_branch_idx = torch.argmin(branch_scores, dim=1)
+
+        batch_indices = torch.arange(branch_logits.size(0), device=device)
+        routed_logits = branch_logits[batch_indices, best_branch_idx]
+        return routed_logits, best_branch_idx
+
+    def evaluate_domains(
+        self,
         df_dev_test,
+        candidate_domains: List[str],
         batch_size: int,
         num_workers: int,
         device: str,
     ) -> float:
-        self.model.to(device)
+        self.model = self.model.to(device)
         self.model.eval()
 
-        seen_task_ids = list(range(len(seen_domain_names)))
-        accs = []
+        id_to_class = {v: k for k, v in config.dict_class_labels.items()}
+        ensure_dir(config.output_folder)
 
-        for idx, domain_name in enumerate(seen_domain_names):
+        available_domains = sorted(list(df_dev_test["domain"].unique()))
+        eval_domains = [d for d in ["D1", "D2", "D3"] if d in available_domains]
+
+        all_acc = []
+
+        for domain_name in eval_domains:
             valid_df = df_dev_test[df_dev_test["domain"].isin([domain_name])]
             loader = self._make_loader(valid_df, batch_size=1, shuffle=False, num_workers=num_workers)
-            acc = self._compute_routed_accuracy(
-                loader=loader,
-                seen_task_ids=seen_task_ids,
-                seen_domain_names=seen_domain_names,
-                device=device,
-                output_tag=domain_name,
-            )
-            print(f"seen domain: ['{domain_name}'] and its accuracy: {acc}")
-            self.logger.set_domain_acc(domain_name, acc)
-            accs.append(acc)
 
-        avg_acc = float(np.mean(accs)) if len(accs) > 0 else 0.0
+            correct = 0
+            total = 0
+
+            out_file = os.path.join(
+                config.output_folder,
+                f"output_geometry_{domain_name}_{now_str()}.txt"
+            )
+
+            with open(out_file, "w", encoding="utf-8") as f:
+                for inputs, targets, audio_files in loader:
+                    inputs = inputs.float().to(device)
+                    targets = targets.float().to(device)
+                    gt = torch.argmax(targets, dim=-1)
+
+                    routed_logits, best_branch_idx = self.route_and_predict(
+                        inputs,
+                        candidate_domains=candidate_domains,
+                        device=device,
+                        alpha_energy=1.0,
+                        beta_anchor=0.1,
+                    )
+                    pred = torch.argmax(routed_logits, dim=1)
+
+                    correct += (pred == gt).sum().item()
+                    total += gt.numel()
+
+                    pred_labels = [id_to_class[int(p)] for p in pred.detach().cpu().tolist()]
+                    routed_domains = [candidate_domains[int(i)] for i in best_branch_idx.detach().cpu().tolist()]
+
+                    for file_name, label, routed_domain in zip(audio_files, pred_labels, routed_domains):
+                        f.write(file_name + "\t" + label + "\t" + routed_domain + "\n")
+
+            acc = round(100.0 * correct / max(total, 1), 2)
+            print(f"eval domain: {domain_name} | candidate branches: {candidate_domains} | acc: {acc}")
+            self.logger.set_domain_acc(domain_name, acc)
+            all_acc.append(acc)
+
+        avg_acc = float(np.mean(all_acc)) if len(all_acc) > 0 else 0.0
         self.logger.set_avg_acc(avg_acc)
         return avg_acc
 
 
 # =========================================================
-# Train Entry
+# train entry
 # =========================================================
 
 def train(args):
@@ -504,67 +560,88 @@ def train(args):
 
     device = "cuda" if (args.cuda and torch.cuda.is_available()) else "cpu"
     logger = RunLogger(args_dict=vars(args).copy(), exp_id=args.exp_id, base_dir=args.log_dir)
-    logger.write_note("Geometry training started.")
+    logger.write_note("D1 checkpoint initialized geometry experiment started.")
     logger.write_note(f"Device: {device}")
 
     try:
-        classes_num = config.classes_num_DIL
         df_dev_train = config.df_DIL_dev_train
         df_dev_test = config.df_DIL_dev_test
 
-        # Geometry version: D2 -> task 0, D3 -> task 1
-        dil_tasks = ["D2", "D3"]
-        print("Tasks:", [[d] for d in dil_tasks])
-
-        model = Learner(
-            sample_rate=sample_rate,
-            window_size=window_size,
-            hop_size=hop_size,
-            mel_bins=mel_bins,
-            fmin=fmin,
-            fmax=fmax,
-            classes_num=classes_num,
-            num_tasks=len(dil_tasks),
+        learner = Learner(
             logger=logger,
+            sample_rate=config.sample_rate,
+            window_size=config.window_size,
+            hop_size=config.hop_size,
+            mel_bins=config.mel_bins,
+            fmin=config.fmin,
+            fmax=config.fmax,
+            classes_num=config.classes_num_DIL,
+            num_tasks=3,
+            embed_dim=args.embed_dim,
         )
 
-        seen_domains = []
+        # 1) initialize from D1 checkpoint
+        learner.initialize_from_d1_checkpoint(device=device, ckpt_name=args.d1_checkpoint_name)
 
-        for domain_name in dil_tasks:
-            seen_domains.append(domain_name)
+        # optional: save D1-initialized geometry state
+        if args.save_d1_init:
+            learner.save_geometry_checkpoint("D1")
 
-            train_df = df_dev_train[df_dev_train["domain"].isin([domain_name])]
-            test_df = df_dev_test[df_dev_test["domain"].isin([domain_name])]
-
-            print(f"\n[Incremental setup] domain={domain_name}, train={len(train_df)}, test={len(test_df)}")
-
-            model.incremental_setup(
-                train_df=train_df,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                device=device,
-                args=args,
-                task_name=domain_name,
-            )
-
-            avg_acc = model.evaluate_seen_domains(
-                seen_domain_names=seen_domains,
+        # 2) evaluate initial state with D1 as only candidate if any D1 exists in dev_test
+        if args.eval_before_incremental:
+            avg_acc = learner.evaluate_domains(
                 df_dev_test=df_dev_test,
+                candidate_domains=["D1"],
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
                 device=device,
             )
-            print("Average Accuracy:", round(avg_acc, 2))
+            print(f"[Before incremental] Average Accuracy: {avg_acc:.2f}")
+
+        # 3) incremental training on D2 then D3
+        incremental_domains = ["D2", "D3"]
+
+        for domain_name in incremental_domains:
+            train_df = df_dev_train[df_dev_train["domain"].isin([domain_name])]
+            print(f"\n[Incremental setup] domain={domain_name}, train={len(train_df)}")
+
+            if len(train_df) == 0:
+                logger.write_note(f"Skipped {domain_name}: no training samples found.")
+                continue
+
+            if args.resume:
+                learner.load_geometry_checkpoint(domain_name, device=device)
+                if domain_name not in learner.seen_domains:
+                    learner.seen_domains.append(domain_name)
+            else:
+                train_loader = learner._make_loader(
+                    train_df,
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    num_workers=args.num_workers,
+                )
+                learner.incremental_train(train_loader, device=device, args=args, domain_name=domain_name)
+                if domain_name not in learner.seen_domains:
+                    learner.seen_domains.append(domain_name)
+
+            # evaluate with all seen branches including D1
+            avg_acc = learner.evaluate_domains(
+                df_dev_test=df_dev_test,
+                candidate_domains=learner.seen_domains,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                device=device,
+            )
+            print(f"[After {domain_name}] Average Accuracy: {avg_acc:.2f}")
 
         logger.set_status("done")
         logger.save_summary()
         logger.append_result_csv()
         logger.export_notion_row(
-            architecture="GeometryCnn14 + Residual Adapters",
-            cl_method="Stable Class Geometry + Structure Preservation",
+            architecture="GeometryCnn14 (D1-init) + Residual Adapters",
+            cl_method="D1 checkpoint initialization + Structure Preservation",
             augmentation=str(args.augmentation),
         )
-
         print(f"[Logger] saved to: {logger.run_dir}")
 
     except Exception as e:
@@ -577,26 +654,31 @@ def train(args):
 
 
 # =========================================================
-# CLI
+# main
 # =========================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Geometry-preserving DCASE2026 Task7")
+    parser = argparse.ArgumentParser(description="D1-initialized Geometry DCASE2026 Task7")
     subparsers = parser.add_subparsers(dest="mode")
 
     parser_train = subparsers.add_parser("train")
-    parser_train.add_argument("--augmentation", type=str, choices=["none", "mixup"], required=True)
-    parser_train.add_argument("--learning_rate", type=float, required=True)
-    parser_train.add_argument("--batch_size", type=int, required=True)
-    parser_train.add_argument("--num_workers", type=int, required=True)
+    parser_train.add_argument("--augmentation", type=str, choices=["none", "mixup"], default="none")
+    parser_train.add_argument("--learning_rate", type=float, default=1e-4)
+    parser_train.add_argument("--batch_size", type=int, default=32)
+    parser_train.add_argument("--num_workers", type=int, default=8)
     parser_train.add_argument("--cuda", action="store_true", default=False)
-    parser_train.add_argument("--epoch", type=int, required=True)
+    parser_train.add_argument("--epoch", type=int, default=120)
     parser_train.add_argument("--resume", action="store_true", default=False)
     parser_train.add_argument("--save", action="store_true", default=False)
 
     parser_train.add_argument("--seed", type=int, default=1193)
     parser_train.add_argument("--exp_id", type=str, default=None)
     parser_train.add_argument("--log_dir", type=str, default="logs")
+    parser_train.add_argument("--embed_dim", type=int, default=256)
+
+    parser_train.add_argument("--d1_checkpoint_name", type=str, default="checkpoint_D1.pth")
+    parser_train.add_argument("--save_d1_init", action="store_true", default=False)
+    parser_train.add_argument("--eval_before_incremental", action="store_true", default=False)
 
     args = parser.parse_args()
     args.filename = get_filename(__file__)

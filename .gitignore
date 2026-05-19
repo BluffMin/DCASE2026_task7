@@ -5,6 +5,8 @@ __pycache__/
 # Dataset (데이터셋 폴더 이름에 맞게 수정)
 data/
 dataset/
+task7_data/
+checkpoints/
 *.wav
 
 # Model Weights
@@ -17,3 +19,4 @@ dataset/
 .DS_Store
 
 logs
+runs
