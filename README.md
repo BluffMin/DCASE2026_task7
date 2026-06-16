@@ -1,128 +1,99 @@
-This repository contains the baseline code for DCASE 2026 Task 7, Domain-Agnostic Incremental Learning for Audio Classification.
-Participants can build their own systems by extending the provided baseline system. 
+# DCASE 2026 Task 7 - Fine-Tuned Expert Aggregation
 
-## System description
-<p align="justify"> The baseline system includes 6 convolutional blocks. Each block includes 2 convolutional layers, each convolutional layer followed by a batch normalization (BN) layer, with the layer specifications the same as PANNs CNN14.  Global pooling is applied to the last convolutional layer, to get a fixed-length input feature vector to the classifier. The baseline model is trained from scratch on the domain D1, then separate domain-specific BN layers are adapted for domain D2 and D3 in incremental phases. 
-</p>
+This repository contains the cleaned source code for our DCASE 2026 Challenge Task 7 submission on domain-agnostic incremental audio classification.
 
-![](./task7_domain.png)
+The submitted systems use full fine-tuned MCnn14 domain experts. The official D1 checkpoint is used only as the initialization source. A D2 expert is trained with device augmentation, a D3 expert is trained with gain-shift augmentation, and inference aggregates D2/D3 expert probabilities.
 
-<p align="justify">During inference, domain-specific BN layers are predicted and used with domain-shared layers for classification. Specifically, an input audio is forward passed through a combination of shared and domain-specific layers of each domain seen so far and obtains the class probabilities. Subsequently, uncertainty of the model on given input audio among the predicted probabilities is computed using entropy. The domain-specific layers which have minimum entropy, denoting lower uncertainty, are selected for classification.
-</p>
+## Submitted Systems
 
-## Requirements
+| System | Inference | Test-time augmentation |
+|---|---|---|
+| S1 | Entropy soft MoE, tau=3.0 | No |
+| S2 | Entropy soft MoE, tau=4.0 | No |
+| S3 | Entropy soft MoE, tau=3.0 | Full-safe TTA |
+| S4 | Mean probability averaging | No |
 
-To install requirements:
+## Repository Structure
 
-```setup
+```text
+.
+├── README.md
+├── requirements.txt
+├── config_task7.py
+├── domain_net.py
+├── train_domain_aug_tta_routing_d1_router_fast.py
+├── generate_fullfinetune_repro_artifacts.py
+├── scripts/
+│   └── run_task7_fullfinetune_repro.sh
+└── docs/
+    ├── method_summary.md
+    ├── results_summary.md
+    ├── results/
+    └── report_tables/
+```
+
+## Environment Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
-## Data and Features 
 
-* Download the development dataset from the [Zenodo](https://zenodo.org/records/19335184).
-* Prepare the dataset in a format that enables the baseline system to correctly read and process the input audio files. The dataset structure should be:
-```text
-task7_data/
-├── audio
-└── evaluation_setup ├── development_train.txt
-                     └── development_test.txt
+The code expects PyTorch with CUDA support for full training runs.
+
+## Required Data and Checkpoints
+
+Datasets, evaluation audio, and model checkpoints are not included in this public repository. Obtain the official DCASE Task 7 resources separately.
+
+Expected external paths can be supplied through environment variables:
+
+```bash
+export DATA_ROOT=/path/to/task7_data
+export D1_CKPT=/path/to/checkpoint_D1.pth
+export EVAL_ROOT=/path/to/evaluation/audio
 ```
-* Update the path of meta files (development_train.txt and development_test.txt) in the [config_task7](utils/config_task7.py) file.
-* Both development_train.txt and development_test.txt include: file-name, class, domain-id and label:
-```text
-audio/00333.wav	alarm	D2	0
-audio/00334.wav	alarm	D2	0
-audio/00335.wav	alarm	D2	0
-audio/07671.wav	speech	D3	9
-audio/07672.wav	speech	D3	9
-audio/07673.wav	speech	D3	9
+
+`DATA_ROOT` should contain the official metadata and evaluation setup files, including `evaluation_setup/development_train.txt` and `evaluation_setup/development_test.txt`.
+
+## Training D2/D3 Experts
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_task7_fullfinetune_repro.sh
 ```
-* Labels for corresponding sounds are listed in [config_task7](utils/config_task7.py).
-* We segmented the audios in development train into 4-second signals for training the baseline system in batches using [chunking](utils/chunking.py). The testing samples have variable lengths. During inference, we predict the class label per audio file. 
-* Log mel-band energies are obtained from sounds using [torchlibrosa](https://github.com/qiuqiangkong/torchlibrosa) library.
-* The baseline system writes the output.txt file to the output_folder path specified in [config_task7](utils/config_task7.py).
 
-## Checkpoints
-The development data of the domain D1 is not available. However, the pre-trained models on D1 (checkpoint_D1.pth), D2 (checkpoint_D2.pth) and D3 (checkpoint_D3.pth) can be downloaded from [here](https://drive.google.com/drive/folders/1C21s1KlN4ZbnboIdtO8H0T-S0_k8yw3o?usp=sharing).  Store all the checkpoints in a folder 'checkpoints/BN/' or updated the 'save_resume_path' in [config_task7](utils/config_task7.py) to check the results of the baseline system on development test set.
+The runner trains plain MCnn14 D2/D3 experts from the official D1 checkpoint:
 
+- D2 training augmentation: device augmentation
+- D3 training augmentation: gain-shift augmentation
+- Objective: cross entropy
+- Optimizer: AdamW with cosine learning-rate schedule
 
-#### Training and evaluation
-To train the baseline (domain-specific BN layers) from scratch on D2 and D3:
+Use `SMOKE_TEST=1` for a one-epoch syntax and pipeline check without producing final submission artifacts:
+
+```bash
+SMOKE_TEST=1 CUDA_VISIBLE_DEVICES=0 bash scripts/run_task7_fullfinetune_repro.sh
 ```
-python baseline/baseline_DIL_task7.py train --augmentation='none' --learning_rate=1e-4 --batch_size=32 --cuda --num_workers 16 --epoch 120 --save
-```
-To test the baseline performance on D2 and D3 using pre-trained model checkpoints:
-```
-python baseline/baseline_DIL_task7.py train --augmentation='none' --learning_rate=1e-4 --batch_size=32 --cuda --num_workers 16 --epoch 120 --resume
-```
-## Parameters
-#### Acoustic features
-- Sampling rate:  32 kHz
-- Training samples in the development set are segmented into 4-second signals, while the testing samples have variable lengths.
-- Log mel-band energies (64 bands) with lower and upper cut-off frequencies 50 Hz and 14 kHz respectively. The window (Hamming) size is set to 1024 samples  and hop size to 320 samples. 
-#### Neural network
-- Architecture
-  - CNN block #1:  
-    - 2 x [2D Convolutional layer (filters: 64, kernel size: 3) + 3 Batch normalization layers (D1, D2 and D3) + ReLu], 2 x 2 average pooling + Dropout (rate: 20%)
-  - CNN block #2:  
-    - 2 x [2D Convolutional layer (filters: 128, kernel size: 3) + 3 Batch normalization layers (D1, D2 and D3) + ReLu], 2 x 2 average pooling + Dropout (rate: 20%)
-  - CNN block #3:  
-    - 2 x [2D Convolutional layer (filters: 256, kernel size: 3) + 3 Batch normalization layers (D1, D2 and D3) + ReLu], 2 x 2 average pooling + Dropout (rate: 20%)
-  - CNN block #4:  
-    - 2 x [2D Convolutional layer (filters: 512, kernel size: 3) + 3 Batch normalization layers (D1, D2 and D3) + ReLu], 2 x 2 average pooling + Dropout (rate: 20%)
-  - CNN block #5:  
-    - 2 x [2D Convolutional layer (filters: 1024, kernel size: 3) + 3 Batch normalization layers (D1, D2 and D3) + ReLu], 2 x 2 average pooling + Dropout (rate: 20%)
-  - CNN block #6:  
-    - 2 x [2D Convolutional layer (filters: 2048, kernel size: 3) + 3 Batch normalization layers (D1, D2 and D3) + ReLu], 2 x 2 average pooling + Dropout (rate: 20%)
-  - Global pooling
-  - Output layer (activation: softmax)
-- Learning: 120 epochs (batch size 32), data shuffling between epochs
-- Optimizer: Adam (learning rate at initial phase: 0.0001, at incremental phases: 0.00001)
-- Scheduler: CosineAnnealingLR
 
-## Results for the development dataset:
+## Generating Submission Artifacts
 
-Results of baseline are calculated using PyTorch in GPU mode . The baseline is trained for 120 epochs and tested on the test split of the development dataset.
-<table class="dataset-table">
-  <thead>   
-  </thead>
-  <tbody>
-    <tr>
-      <td>D3</td>
-      <td></td>
-      <td>35.0</td>
-    </tr>
-    <tr>
-      <td>D2</td>
-      <td>54.7</td>
-      <td>54.7</td>
-    </tr>
-    <tr>
-      <td>Average accuracy</td>
-      <td>54.7</td>
-      <td>44.8</td>
-    </tr>
-    
-  </tbody>
-</table>
+After checkpoints exist, the runner calls `generate_fullfinetune_repro_artifacts.py` to compute development metrics, report tables, and submission-format outputs. Generated outputs are written under `runs/`, which is intentionally ignored by git.
 
-The baseline model first learns to classify sounds from domain D2, obtains an accuracy of 54.7% on D2 data. Then, it incrementally learns domain D3 and obtains an accuracy of 35.0% on D3. 
-The average accuracy of the baseline model on D2 and D3 is 44.8%. 
-D1 results will be included in the overall average after the challenge deadline. 
+## Results
 
+See [docs/results_summary.md](docs/results_summary.md) for the validation summary. Small CSV summaries are included under `docs/results/` for reproducibility at the report level.
 
-Note: The reported baseline system performance is not exactly reproducible due to varying setups. However, you should be able to obtain very similar results.
+## Notes
 
+- Checkpoints (`*.pth`, `*.pt`, `*.ckpt`) are intentionally excluded.
+- Official development/evaluation audio is intentionally excluded.
+- Submission output CSV/ZIP files are intentionally excluded from this source-code repository.
+- The official D1 checkpoint must be obtained from the DCASE Task 7 resources.
 
-## Citation
-If you are using the baseline system, please cite the following: 
+## Citation / Task Link
 
-```BibTeX
-@INPROCEEDINGS{10890481,
-  author={Manjunath Mulimani and Annamaria Mesaros},
-  booktitle={IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)}, 
-  title={Domain-Incremental Learning for Audio Classification}, 
-  year={2025}, 
-  pages={1-5}
-  }
-```
+Please refer to the official DCASE Challenge Task 7 page for task rules, data access, and evaluation protocol.
+
+## Contact
+
+Seungmin Heo: [smheo@seoultech.ac.kr](mailto:smheo@seoultech.ac.kr)

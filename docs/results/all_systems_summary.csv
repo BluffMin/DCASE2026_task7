@@ -1,0 +1,5 @@
+﻿System,Expert training,Inference,Remarks,Step2 D2,Step3 D2,Step3 D3,Step3 Avg.,Step3 D2 macro,Step3 D3 macro
+S1,D2: device; D3: gain-shift,entropy soft-MoE tau=3.0,Main entropy-guided soft MoE.,0.7965571205007824,0.8028169014084507,0.5446650124069479,0.6737409569076993,0.7692714132640801,0.49518869604112303
+S2,D2: device; D3: gain-shift,entropy soft-MoE tau=4.0,High-temperature soft MoE; tau=4.0 recovered from previous configs.,0.7965571205007824,0.8012519561815337,0.5471464019851117,0.6741991790833226,0.7683098748025416,0.4964105022046517
+S3,D2: device; D3: gain-shift,entropy soft-MoE tau=3.0 with full_safe TTA,Safe deterministic waveform TTA.,0.7965571205007824,0.7981220657276995,0.5607940446650124,0.6794580551963559,0.7604644580927613,0.5041812133997293
+S4,D2: device; D3: gain-shift,mean probability average,Deterministic non-TTA probability average.,0.7965571205007824,0.7981220657276995,0.5595533498759305,0.6788377078018151,0.7667991027524536,0.508985621303218

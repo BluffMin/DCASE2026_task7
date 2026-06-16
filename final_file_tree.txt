@@ -1,0 +1,17 @@
+.gitignore
+README.md
+config_task7.py
+docs/method_summary.md
+docs/report_tables/report_table_classwise_S1.tex
+docs/report_tables/report_table_development_results.tex
+docs/report_tables/report_table_system_configs.tex
+docs/results/all_experiments_development_d2_d3_avg.csv
+docs/results/all_systems_summary.csv
+docs/results/step2_step3_domain_classwise_accuracy.csv
+docs/results_summary.md
+domain_net.py
+final_file_tree.txt
+generate_fullfinetune_repro_artifacts.py
+requirements.txt
+scripts/run_task7_fullfinetune_repro.sh
+train_domain_aug_tta_routing_d1_router_fast.py

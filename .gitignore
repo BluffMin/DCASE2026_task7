@@ -1,2 +1,47 @@
-*.wav
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environment / local config
+.env
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
+
+# Model weights and generated binaries
 *.pth
+*.pt
+*.ckpt
+*.zip
+*.tar
+*.tar.gz
+*.npy
+*.npz
+*.h5
+*.pkl
+
+# Audio and datasets
+*.wav
+*.flac
+*.mp3
+data/
+dataset/
+datasets/
+task7_data/
+eval/
+evaluation/
+evaluation_audio/
+
+# Experiment outputs
+runs/
+wandb/
+logs/
+outputs/
+final_submission_package/
+
+# Generated submission files
+*.output.csv

@@ -1,0 +1,10 @@
+\begin{tabular}{lccc}
+\toprule
+System & Expert training & Inference & Remarks \\
+\midrule
+S1 & D2: device; D3: gain-shift & entropy soft-MoE tau=3.0 & Main entropy-guided soft MoE. \\
+S2 & D2: device; D3: gain-shift & entropy soft-MoE tau=4.0 & High-temperature soft MoE; tau=4.0 recovered from previous configs. \\
+S3 & D2: device; D3: gain-shift & entropy soft-MoE tau=3.0 with full_safe TTA & Safe deterministic waveform TTA. \\
+S4 & D2: device; D3: gain-shift & mean probability average & Deterministic non-TTA probability average. \\
+\bottomrule
+\end{tabular}

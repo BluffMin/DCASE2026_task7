@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+import warnings
 
 sample_rate = 32000
 clip_samples = sample_rate * 4
@@ -24,17 +25,24 @@ save_resume_path = os.path.join(BASE_DIR, 'checkpoints', 'BN')
 audio_folder_DIL = os.path.join(BASE_DIR, 'task7_data')
 output_folder = os.path.join(audio_folder_DIL, 'results')
 
-df_DIL_dev_train = pd.read_csv(
-    os.path.join(audio_folder_DIL, 'evaluation_setup', 'development_train.txt'),
-    sep='\t',
-    names=['filename', 'target', 'domain', 'new_target']
-)
+_SPLIT_COLUMNS = ['filename', 'target', 'domain', 'new_target']
 
-df_DIL_dev_test = pd.read_csv(
-    os.path.join(audio_folder_DIL, 'evaluation_setup', 'development_test.txt'),
-    sep='\t',
-    names=['filename', 'target', 'domain', 'new_target']
-)
+
+def _read_split_or_empty(name):
+    path = os.path.join(audio_folder_DIL, 'evaluation_setup', name)
+    if not os.path.exists(path):
+        warnings.warn(
+            f"Task 7 split file not found: {path}. "
+            "Returning an empty DataFrame; set DATA_ROOT or place the official "
+            "task7_data directory before running training/evaluation.",
+            RuntimeWarning,
+        )
+        return pd.DataFrame(columns=_SPLIT_COLUMNS)
+    return pd.read_csv(path, sep='\t', names=_SPLIT_COLUMNS)
+
+
+df_DIL_dev_train = _read_split_or_empty('development_train.txt')
+df_DIL_dev_test = _read_split_or_empty('development_test.txt')
 
 dict_class_labels = {
     'alarm': 0,
