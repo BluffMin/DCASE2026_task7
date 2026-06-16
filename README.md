@@ -96,4 +96,4 @@ Please refer to the official DCASE Challenge Task 7 page for task rules, data ac
 
 ## Contact
 
-Seungmin Heo: [smheo@seoultech.ac.kr](mailto:smheo@seoultech.ac.kr)
+Semin Heo: [smheo@seoultech.ac.kr](mailto:smheo@seoultech.ac.kr)
